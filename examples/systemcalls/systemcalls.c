@@ -1,4 +1,10 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +22,14 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    int result = system(cmd);
+    if (result == -1)
+    {
+        fprintf(stderr, "Error: System call failed. Command: \"%s\".\n", cmd);
+        return false;
+    }
 
-    return true;
+    return (result == EXIT_SUCCESS);
 }
 
 /**
@@ -58,8 +70,43 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
-
     va_end(args);
+
+    fflush(stdout);
+    fflush(stderr);
+
+    int pid = fork();
+    if (pid == -1)
+    {
+        fprintf(stderr, "Error: Fork call failed. Error: \"%s\".\n", strerror(errno));
+        return false;
+    }
+    else if (pid == 0)
+    {
+        execv(command[0], command);
+        fprintf(stderr, "Error: Execv call failed in child process. Error: \"%s\".\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    else
+    {
+        int waitStatus;
+        int result = waitpid(pid, &waitStatus, 0);
+        if (result == -1)
+        {
+            fprintf(stderr, "Error: Wait call failed. Error: \"%s\".\n", strerror(errno));
+            return false;   
+        }
+        else if (WIFSIGNALED(waitStatus))
+        {
+            fprintf(stderr, "Error: Child process has been terminated. Signal: \"%s\".\n", strsignal(WTERMSIG(waitStatus)));
+            return false;   
+        }
+        else if (WIFEXITED(waitStatus) && WEXITSTATUS(waitStatus) != EXIT_SUCCESS)
+        {
+            fprintf(stderr, "Error: Child process has been exited with failure. Exit Code: %d.\n", WEXITSTATUS(waitStatus));
+            return false;   
+        }
+    }
 
     return true;
 }
@@ -92,8 +139,61 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
-
     va_end(args);
+
+    int fd = open(outputfile, O_WRONLY | O_CREAT);
+    if (fd == -1)
+    {
+        fprintf(stderr, "Error: Cannot open file for writing. File Path: \"%s\", Error: \"%s\".\n", outputfile, strerror(errno));
+        return false;
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+
+    int pid = fork();
+    if (pid == -1)
+    {
+        fprintf(stderr, "Error: Fork call failed. Error: \"%s\".\n", strerror(errno));
+        return false;
+    }
+    else if (pid == 0)
+    {
+        int origStdout = dup(STDOUT_FILENO);
+        int origStderr = dup(STDERR_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+
+        execv(command[0], command);
+
+        dup2(origStdout, STDOUT_FILENO);
+        dup2(origStderr, STDERR_FILENO);
+        fprintf(stderr, "Error: Execv call failed in child process. Error: \"%s\".\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    else
+    {
+        close(fd);
+
+        int waitStatus;
+        int result = waitpid(pid, &waitStatus, 0);
+        if (result == -1)
+        {
+            fprintf(stderr, "Error: Wait call failed. Error: \"%s\".\n", strerror(errno));
+            return false;   
+        }
+        else if (WIFSIGNALED(waitStatus))
+        {
+            fprintf(stderr, "Error: Child process has been terminated. Signal: \"%s\".\n", strsignal(WTERMSIG(waitStatus)));
+            return false;   
+        }
+        else if (WIFEXITED(waitStatus) && WEXITSTATUS(waitStatus) != EXIT_SUCCESS)
+        {
+            fprintf(stderr, "Error: Child process has been exited with failure. Exit Code: %d.\n", WEXITSTATUS(waitStatus));
+            return false;   
+        }
+    }
 
     return true;
 }
