@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 if [[ $# != 2 ]]; then
     echo "Error: Invalid argument count." >&2
