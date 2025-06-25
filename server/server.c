@@ -213,7 +213,7 @@ void MainLoop()
         TearDown(EXIT_FAILURE);
     }
 
-    g_outputFile = open(g_outputFilePath, O_RDWR | O_CREAT);
+    g_outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
     if (g_outputFile == -1)
     {
         syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
@@ -282,7 +282,11 @@ void StartDaemon()
 
         setsid();
         
-        chdir("/");
+        if (chdir("/") == -1)
+        {
+            syslog(LOG_ERR, "Cannot change current working directory.");
+            TearDown(EXIT_FAILURE);
+        }
 
         int nullFile = open("/dev/null", O_RDWR);
         dup2(nullFile, STDIN_FILENO);
