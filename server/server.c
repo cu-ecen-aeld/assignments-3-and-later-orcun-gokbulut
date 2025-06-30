@@ -10,66 +10,284 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <pthread.h>
+
+#define RETRY_ON_INTERRUPT(expression)                  \
+({                                                      \
+    int RETRY_ON_INTERRUPT_result = 0;                  \
+    while (true)                                        \
+    {                                                   \
+        RETRY_ON_INTERRUPT_result = (expression);   \
+        if (RETRY_ON_INTERRUPT_result == -1)            \
+        {                                               \
+            if (errno == EINTR)                         \
+                continue;                               \
+            else                                        \
+                break;                                  \
+        }                                               \
+        else                                            \
+        {                                               \
+            break;                                      \
+        }                                               \
+    }                                                   \
+    RETRY_ON_INTERRUPT_result;                          \
+})
+
+struct Client
+{
+    int socket;
+    struct sockaddr_in address;
+    pthread_t threadId;
+    size_t lineBufferCursor;
+    size_t lineBufferSize;
+    char* lineBuffer;
+    struct Client* next;
+};
 
 static bool g_exitProgram = false;
 static int g_serverSocket = -1;
-static int g_clientSocket = -1;
 static int g_outputFile = -1;
-static size_t g_lineBufferCursor = 0;
-static const size_t g_lineBufferStartSize = 64;
-static size_t g_lineBufferSize = 0;
-static char* g_lineBuffer = NULL;
+static struct Client* g_clientListHead;
+static pthread_mutex_t g_clientListMutex;
+static pthread_mutex_t g_outputFileMutex;
 static const char* g_outputFilePath = "/var/tmp/aesdsocketdata";
 static struct sigaction g_oldSigtermHandler;
 static struct sigaction g_oldSigintHandler;
+const size_t g_lineBufferStartSize = 64;
+
+void TearDownClient(struct Client* client)
+{
+    syslog(LOG_INFO, "Terminating client... Client Id: %ld.", client->threadId);
+
+    close(client->socket);
+
+    if (client->lineBuffer != NULL)
+    {
+        free(client->lineBuffer);
+        client->lineBuffer = NULL;
+    }
+
+    pthread_mutex_lock(&g_clientListMutex);
+    if (g_clientListHead == client)
+    {
+        g_clientListHead = client->next;
+    }
+    else
+    {
+        struct Client* currentClient = g_clientListHead;
+        while (currentClient != NULL)
+        {
+            if (currentClient->next == client)
+            {
+                currentClient->next = client->next;
+                break;
+            }
+            currentClient = currentClient->next;
+        }
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+    free(client);
+
+    pthread_exit(NULL);
+}
+
+void TearDownServer(int exitCode)
+{
+    syslog(LOG_INFO, "Terminating...");
+
+    g_exitProgram = true;
+
+    pthread_mutex_lock(&g_clientListMutex);
+    struct Client* currentClient = g_clientListHead;
+    while (currentClient != NULL)
+    {
+        pthread_t threadId = g_clientListHead->threadId;
+        pthread_mutex_unlock(&g_clientListMutex);
+
+        pthread_join(threadId, NULL);
+
+        pthread_mutex_lock(&g_clientListMutex);
+        currentClient = g_clientListHead;
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+
+    g_clientListHead = NULL;
+
+    if (g_outputFile != -1)
+    {
+        close(g_outputFile);
+        g_outputFile = -1;
+    }
+
+    remove(g_outputFilePath);
+
+    if (g_serverSocket != -1)
+    {
+        close(g_serverSocket);
+        g_serverSocket = -1;
+    }
+
+    if (g_exitProgram)
+        syslog(LOG_ERR, "Caught signal exiting");
+    
+    closelog();
+
+    sigaction(SIGTERM, &g_oldSigtermHandler, NULL);
+    sigaction(SIGTERM, &g_oldSigintHandler, NULL);
+
+    exit(exitCode);
+}
+
+void ProcessPackage(struct Client* client)
+{
+    pthread_mutex_lock(&g_outputFileMutex);
+
+    if (RETRY_ON_INTERRUPT(write(g_outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
+    {
+        pthread_mutex_unlock(&g_outputFileMutex);
+
+        syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownClient(client);                   
+    }
+
+    fsync(g_outputFile);
+    pthread_mutex_unlock(&g_outputFileMutex);
+
+    pthread_mutex_lock(&g_outputFileMutex);
+    off_t fileSize = lseek(g_outputFile, 0, SEEK_END);
+    if (fileSize == -1)
+    {
+        pthread_mutex_unlock(&g_outputFileMutex);
+        
+        syslog(LOG_ERR, "Cannot seek at the end of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownClient(client);
+    }
+    
+    if (lseek(g_outputFile, 0, SEEK_SET) == -1)
+    {
+        pthread_mutex_unlock(&g_outputFileMutex);
+
+        syslog(LOG_ERR, "Cannot seek at the start of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownClient(client); 
+    }
+    
+    while (fileSize > 0)
+    {
+        char fileBuffer[512];
+        int readBytes = RETRY_ON_INTERRUPT(read(g_outputFile, fileBuffer, sizeof(fileBuffer)));
+        if (readBytes == -1)
+        {
+            pthread_mutex_unlock(&g_outputFileMutex);
+
+            syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+        }
+
+        int sendResult = RETRY_ON_INTERRUPT(send(client->socket, fileBuffer, readBytes, 0));
+        if (sendResult == -1)
+        {
+            pthread_mutex_unlock(&g_outputFileMutex);
+
+            syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+        }
+
+        fileSize -= readBytes;
+    }
+    pthread_mutex_unlock(&g_outputFileMutex);
+
+    client->lineBufferCursor = 0;
+}
+
+void ParsePackage(struct Client* client, const char* recvBuffer, size_t recvBytes)
+{
+    for (size_t i = 0; i < recvBytes; i++)
+    {
+        // Exponential Line Buffer Heap Allocation
+        if (client->lineBufferCursor + 1 > client->lineBufferSize)
+        {
+            if (client->lineBuffer == NULL)
+            {
+                client->lineBufferSize = g_lineBufferStartSize;
+                client->lineBuffer = malloc(client->lineBufferSize);
+                if (client->lineBuffer == NULL)
+                {
+                    syslog(LOG_ERR, "Cannot allocate line buffer memory.");
+                    TearDownClient(client);
+                }
+            }
+            else
+            {
+                client->lineBufferSize *= 2;
+                client->lineBuffer = realloc(client->lineBuffer, client->lineBufferSize);
+                if (client->lineBuffer == NULL)
+                {
+                    syslog(LOG_ERR, "Cannot reallocate line buffer memory.");
+                    TearDownClient(client);
+                }
+            }
+        }
+
+        client->lineBuffer[client->lineBufferCursor] = recvBuffer[i];
+        client->lineBufferCursor++;
+        
+        if (recvBuffer[i] == '\n')
+            ProcessPackage(client);
+    }
+}
+
+void* ClientLoop(void* argument)
+{
+    pthread_mutex_lock(&g_clientListMutex);
+    struct Client* client = (struct Client*)argument;
+    client->threadId = pthread_self();
+    if (g_clientListHead == NULL)
+    {
+        g_clientListHead = client;
+    }
+    else
+    {
+        struct Client* currentClient = g_clientListHead;
+        while (currentClient->next != NULL)
+            currentClient = currentClient->next;
+        currentClient->next = client;
+    }
+    pthread_mutex_unlock(&g_clientListMutex);
+
+    while (!g_exitProgram)
+    {
+        char recvBuffer[512];
+        int recvBytes = RETRY_ON_INTERRUPT(recv(client->socket, recvBuffer, sizeof(recvBuffer), 0));
+        if (recvBytes == 0)
+        {
+            syslog(LOG_INFO, "Closed connection from %d.%d.%d.%d", 
+                (int)((uint8_t*)&client->address.sin_addr)[3],
+                (int)((uint8_t*)&client->address.sin_addr)[2],
+                (int)((uint8_t*)&client->address.sin_addr)[1],
+                (int)((uint8_t*)&client->address.sin_addr)[0]
+            );
+            TearDownClient(client);
+        }
+        else if (recvBytes == -1)
+        {
+            syslog(LOG_ERR, "Socket recv error. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
+            TearDownClient(client);
+        }
+
+        ParsePackage(client, recvBuffer, recvBytes);
+    }
+
+    TearDownClient(client);
+
+    return NULL;
+}
 
 void SignalHandler()
 {
     g_exitProgram = true;
 }
 
-void TearDown(int exitCode)
-{
-        syslog(LOG_INFO, "Terminating...");
-        if (g_clientSocket != -1)
-        {
-            close(g_clientSocket);
-            g_clientSocket = -1;
-        }
-
-        if (g_outputFile != -1)
-        {
-            close(g_outputFile);
-            g_outputFile = -1;
-        }
-
-        remove(g_outputFilePath);
-
-        if (g_serverSocket != -1)
-        {
-            close(g_serverSocket);
-            g_serverSocket = -1;
-        }
-
-        if (g_lineBuffer != NULL)
-        {
-            free(g_lineBuffer);
-            g_lineBuffer = NULL;
-            g_lineBufferSize = 0;
-        }
-
-        if (g_exitProgram)
-            syslog(LOG_ERR, "Caught signal exiting");
-        
-        closelog();
-
-        sigaction(SIGTERM, &g_oldSigtermHandler, NULL);
-        sigaction(SIGTERM, &g_oldSigintHandler, NULL);
-
-        exit(exitCode);
-}
-
-void Initialize()
+void InitializeServer()
 {
     syslog(LOG_INFO, "Initializing...");
 
@@ -83,20 +301,20 @@ void Initialize()
     if (sigaction(SIGTERM, &signalAction, &g_oldSigtermHandler) != 0)
     {
         syslog(LOG_ERR, "Cannot register signal handler.");
-        TearDown(EXIT_FAILURE);   
+        TearDownServer(EXIT_FAILURE);   
     }
     
     if (sigaction(SIGINT, &signalAction, &g_oldSigintHandler) != 0)
     {
         syslog(LOG_ERR, "Cannot register signal handler.");
-        TearDown(EXIT_FAILURE);   
+        TearDownServer(EXIT_FAILURE);   
     }
  
     g_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (g_serverSocket == -1)
     {
         syslog(LOG_ERR, "Cannot create socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-        TearDown(EXIT_FAILURE);
+        TearDownServer(EXIT_FAILURE);
     }
 
     struct sockaddr_in serverAddress;
@@ -108,116 +326,24 @@ void Initialize()
     if (bindResult == -1)
     {
         syslog(LOG_ERR, "Cannot bind socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-        TearDown(EXIT_FAILURE);
+        TearDownServer(EXIT_FAILURE);
     }
 }
 
-void ProcessPackage()
-{
-    if (write(g_outputFile, g_lineBuffer, g_lineBufferCursor) == -1)
-    {
-        if (errno == EINTR && g_exitProgram)
-            TearDown(EXIT_SUCCESS);
-
-        syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDown(EXIT_FAILURE);                   
-    }
-
-    fsync(g_outputFile);
-
-    off_t fileSize = lseek(g_outputFile, 0, SEEK_END);
-    if (fileSize == -1)
-    {
-        syslog(LOG_ERR, "Cannot seek at the end of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDown(EXIT_FAILURE);
-    }
-    
-    if (lseek(g_outputFile, 0, SEEK_SET) == -1)
-    {
-        syslog(LOG_ERR, "Cannot seek at the start of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDown(EXIT_FAILURE); 
-    }
-    
-    while (fileSize > 0)
-    {
-        char fileBuffer[512];
-        int readBytes = read(g_outputFile, fileBuffer, sizeof(fileBuffer));
-        if (readBytes == -1)
-        {
-            if (errno == EINTR && g_exitProgram)
-                TearDown(EXIT_SUCCESS);
-
-            syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-            TearDown(EXIT_FAILURE);
-        }
-
-        int sendResult = send(g_clientSocket, fileBuffer, readBytes, 0);
-        if (sendResult == -1)
-        {
-            if (errno == EINTR && g_exitProgram)
-                TearDown(EXIT_SUCCESS);
-
-            syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-            break;
-        }
-
-        fileSize -= readBytes;
-    }
-
-    g_lineBufferCursor = 0;
-}
-
-void ParsePackage(const char* recvBuffer, size_t recvBytes)
-{
-    for (size_t i = 0; i < recvBytes; i++)
-    {
-        // Exponential Line Buffer Heap Allocation
-        if (g_lineBufferCursor + 1 > g_lineBufferSize)
-        {
-            if (g_lineBuffer == NULL)
-            {
-                g_lineBufferSize = g_lineBufferStartSize;
-                g_lineBuffer = malloc(g_lineBufferSize);
-                if (g_lineBuffer == NULL)
-                {
-                    syslog(LOG_ERR, "Cannot allocate line buffer memory.");
-                    TearDown(EXIT_FAILURE);
-                }
-            }
-            else
-            {
-                g_lineBufferSize *= 2;
-                g_lineBuffer = realloc(g_lineBuffer, g_lineBufferSize);
-                if (g_lineBuffer == NULL)
-                {
-                    syslog(LOG_ERR, "Cannot reallocate line buffer memory.");
-                    TearDown(EXIT_FAILURE);
-                }
-            }
-        }
-
-        g_lineBuffer[g_lineBufferCursor] = recvBuffer[i];
-        g_lineBufferCursor++;
-        
-        if (recvBuffer[i] == '\n')
-            ProcessPackage();
-    }
-}
-
-void MainLoop()
+void ExecuteServer()
 {
     int listenResult = listen(g_serverSocket, 10);
     if (listenResult == -1)
     {
         syslog(LOG_ERR, "Cannot listen socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-        TearDown(EXIT_FAILURE);
+        TearDownServer(EXIT_FAILURE);
     }
 
     g_outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
     if (g_outputFile == -1)
     {
         syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDown(EXIT_FAILURE);
+        TearDownServer(EXIT_FAILURE);
     }
 
     while (!g_exitProgram)
@@ -225,45 +351,34 @@ void MainLoop()
         struct sockaddr_in clientAddress;
         unsigned int clientAddressSize = sizeof(clientAddressSize);
         memset(&clientAddress, 0, sizeof(clientAddress));
-        g_clientSocket = accept(g_serverSocket, (struct sockaddr*)&clientAddress, &clientAddressSize);
-        if (g_clientSocket == -1)
+        int clientSocket = accept(g_serverSocket, (struct sockaddr*)&clientAddress, &clientAddressSize);
+        if (clientSocket == -1)
         {
             if (errno == EINTR && g_exitProgram)
-                TearDown(EXIT_SUCCESS);
+                TearDownServer(EXIT_SUCCESS);
 
             syslog(LOG_ERR, "Cannot accept socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-            TearDown(EXIT_FAILURE);
+            TearDownServer(EXIT_FAILURE);
         }
 
-        while (!g_exitProgram)
+        struct Client* newClient = (struct Client*)malloc(sizeof(struct Client));
+        if (newClient == NULL)
         {
-            char recvBuffer[512];
-            int recvBytes = recv(g_clientSocket, recvBuffer, sizeof(recvBuffer), 0);
-            if (recvBytes == 0)
-            {
-                syslog(LOG_INFO, "Closed connection from %d.%d.%d.%d", 
-                    (int)((uint8_t*)&clientAddress.sin_addr)[3],
-                    (int)((uint8_t*)&clientAddress.sin_addr)[2],
-                    (int)((uint8_t*)&clientAddress.sin_addr)[1],
-                    (int)((uint8_t*)&clientAddress.sin_addr)[0]
-                );
-                
-                break;
-            }
-            else if (recvBytes == -1)
-            {
-                if (errno == EINTR)
-                {
-                    if (g_exitProgram)
-                        TearDown(EXIT_SUCCESS);
-                }
+            syslog(LOG_ERR, "Cannot allocate thread memory.");
+            TearDownServer(EXIT_FAILURE);
+        }
 
-                syslog(LOG_ERR, "Socket recv error. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-                close(g_clientSocket);
-                break;
-            }
+        memset(newClient, 0, sizeof(struct Client));
+        newClient->socket = clientSocket;
+        memcpy(&newClient->address, &clientAddress, sizeof(clientAddress));
 
-            ParsePackage(recvBuffer, recvBytes);
+        pthread_t newThread;
+        if (pthread_create(&newThread, NULL, &ClientLoop, newClient) != 0)
+        {
+
+            syslog(LOG_ERR, "Cannot create thread.");
+            free(newClient);
+            TearDownServer(EXIT_FAILURE);
         }
     }
 }
@@ -285,7 +400,7 @@ void StartDaemon()
         if (chdir("/") == -1)
         {
             syslog(LOG_ERR, "Cannot change current working directory.");
-            TearDown(EXIT_FAILURE);
+            TearDownServer(EXIT_FAILURE);
         }
 
         int nullFile = open("/dev/null", O_RDWR);
@@ -294,20 +409,20 @@ void StartDaemon()
         dup2(nullFile, STDERR_FILENO);
         close(nullFile);
 
-        MainLoop();
-        TearDown(EXIT_SUCCESS);
+        ExecuteServer();
+        TearDownServer(EXIT_SUCCESS);
     }
     else
     {
-        TearDown(EXIT_SUCCESS);
+        TearDownServer(EXIT_SUCCESS);
     }
 }
 
 void StartApplication()
 {
     syslog(LOG_INFO, "Running as application...");
-    MainLoop();
-    TearDown(EXIT_SUCCESS);
+    ExecuteServer();
+    TearDownServer(EXIT_SUCCESS);
 }
 
 void PrintHelp()
@@ -348,7 +463,7 @@ int main(int argc, char** argv)
         }
     }
 
-    Initialize();
+    InitializeServer();
     
     if (daemonMode)
         StartDaemon();

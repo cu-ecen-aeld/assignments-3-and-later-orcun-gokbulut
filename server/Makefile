@@ -7,15 +7,17 @@ bindir ?= $(exec_prefix)/bin
 TARGET := aesdsocket
 SOURCES := server.c
 OBJECTS := $(SOURCES:.c=.o)
- 
-.DEFAULT: all
+DEPENDENCIES:=$(SOURCES:.c=.d)
 
+.DEFAULT: all
 .PHONY: all
 all: $(TARGET)
 
+-include $(DEPENDENCIES)
+
 %.o: %.c Makefile
 	@echo "[CC] $<"
-	@$(CC) $(ALL_CFLAGS) $(CPPFLAGS) -o $@ -c $<
+	@$(CC) $(ALL_CFLAGS) $(CPPFLAGS) -MMD -MF $*.d -o $@ -c $<
 
 $(TARGET): $(OBJECTS)
 	@echo "[LD] $@"
@@ -31,4 +33,8 @@ clean:
 	@$(foreach OBJECT,$(OBJECTS), \
 		@echo "[RM] $(OBJECT)" ; \
 		$(RM) $(OBJECT) \
+  	)
+	@$(foreach DEPENDENCY,$(DEPENDENCIES), \
+		@echo "[RM] $(DEPENDENCY)" ; \
+		$(RM) $(DEPENDENCY) \
   	)
