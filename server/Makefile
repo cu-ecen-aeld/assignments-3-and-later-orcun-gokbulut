@@ -1,8 +1,9 @@
 ALL_CFLAGS := -Wall -Werror -ggdb3 $(CFLAGS)
-INSTALL_PROGRAM := $(INSTALL)
+DESTDIR ?= /
 prefix ?= /usr/local
-exec_prefix ?= $(prefix)
-bindir ?= $(exec_prefix)/bin
+bindir ?= $(prefix)/bin
+
+INSTALL := install
 
 TARGET := aesdsocket
 SOURCES := server.c
@@ -24,7 +25,13 @@ $(TARGET): $(OBJECTS)
 	@$(CC) $(LDFLAGS) -o $@ $^
 
 install: $(TARGET)
-	@$(INSTALL_PROGRAM) $(TARGET) $(DESTDIR)$(bindir)/$(TARGET)
+	@echo "[INSTALL] aesdsocket.service.sh"	
+	@$(INSTALL) -T -D -m 0755 aesdsocket.service.sh $(DESTDIR)/etc/init.d/aesdsocket
+	@echo "[INSTALL] $(TARGET)"
+	@$(INSTALL) -T -D $(TARGET) $(DESTDIR)/$(bindir)/$(TARGET)
+	@echo "[LN] S99aesdsocket"
+	@mkdir -p $(DESTDIR)/etc/rcS.d
+	@ln -s /etc/init.d/aesdsocket $(DESTDIR)/etc/rcS.d/S99aesdsocket
 
 .PHONY: clean
 clean:

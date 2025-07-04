@@ -47,6 +47,7 @@ struct Client
 static bool g_exitProgram = false;
 static int g_serverSocket = -1;
 static int g_outputFile = -1;
+static pthread_t timestampThread;
 static struct Client* g_clientListHead;
 static pthread_mutex_t g_clientListMutex;
 static pthread_mutex_t g_outputFileMutex;
@@ -87,8 +88,6 @@ void TearDownClient(struct Client* client)
     }
     pthread_mutex_unlock(&g_clientListMutex);
     free(client);
-
-    pthread_exit(NULL);
 }
 
 void TearDownServer(int exitCode)
@@ -96,6 +95,8 @@ void TearDownServer(int exitCode)
     syslog(LOG_INFO, "Terminating...");
 
     g_exitProgram = true;
+
+    pthread_join(timestampThread, NULL);
 
     pthread_mutex_lock(&g_clientListMutex);
     struct Client* currentClient = g_clientListHead;
@@ -138,7 +139,7 @@ void TearDownServer(int exitCode)
     exit(exitCode);
 }
 
-void ProcessPackage(struct Client* client)
+bool ProcessPackage(struct Client* client)
 {
     pthread_mutex_lock(&g_outputFileMutex);
 
@@ -147,7 +148,8 @@ void ProcessPackage(struct Client* client)
         pthread_mutex_unlock(&g_outputFileMutex);
 
         syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownClient(client);                   
+        TearDownClient(client);
+        return false;                  
     }
 
     fsync(g_outputFile);
@@ -161,6 +163,7 @@ void ProcessPackage(struct Client* client)
         
         syslog(LOG_ERR, "Cannot seek at the end of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
         TearDownClient(client);
+        return false;
     }
     
     if (lseek(g_outputFile, 0, SEEK_SET) == -1)
@@ -168,7 +171,8 @@ void ProcessPackage(struct Client* client)
         pthread_mutex_unlock(&g_outputFileMutex);
 
         syslog(LOG_ERR, "Cannot seek at the start of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownClient(client); 
+        TearDownClient(client);
+        return false;
     }
     
     while (fileSize > 0)
@@ -181,6 +185,7 @@ void ProcessPackage(struct Client* client)
 
             syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
             TearDownClient(client);
+            return false;
         }
 
         int sendResult = RETRY_ON_INTERRUPT(send(client->socket, fileBuffer, readBytes, 0));
@@ -190,6 +195,7 @@ void ProcessPackage(struct Client* client)
 
             syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
             TearDownClient(client);
+            return false;
         }
 
         fileSize -= readBytes;
@@ -197,9 +203,11 @@ void ProcessPackage(struct Client* client)
     pthread_mutex_unlock(&g_outputFileMutex);
 
     client->lineBufferCursor = 0;
+
+    return true;
 }
 
-void ParsePackage(struct Client* client, const char* recvBuffer, size_t recvBytes)
+bool ParsePackage(struct Client* client, const char* recvBuffer, size_t recvBytes)
 {
     for (size_t i = 0; i < recvBytes; i++)
     {
@@ -214,6 +222,7 @@ void ParsePackage(struct Client* client, const char* recvBuffer, size_t recvByte
                 {
                     syslog(LOG_ERR, "Cannot allocate line buffer memory.");
                     TearDownClient(client);
+                    return false;
                 }
             }
             else
@@ -224,6 +233,7 @@ void ParsePackage(struct Client* client, const char* recvBuffer, size_t recvByte
                 {
                     syslog(LOG_ERR, "Cannot reallocate line buffer memory.");
                     TearDownClient(client);
+                    return false;
                 }
             }
         }
@@ -232,8 +242,13 @@ void ParsePackage(struct Client* client, const char* recvBuffer, size_t recvByte
         client->lineBufferCursor++;
         
         if (recvBuffer[i] == '\n')
-            ProcessPackage(client);
+        {
+            if (!ProcessPackage(client))
+                return false;
+        }
     }
+
+    return true;
 }
 
 void* ClientLoop(void* argument)
@@ -267,18 +282,57 @@ void* ClientLoop(void* argument)
                 (int)((uint8_t*)&client->address.sin_addr)[0]
             );
             TearDownClient(client);
+            return NULL;
         }
         else if (recvBytes == -1)
         {
             syslog(LOG_ERR, "Socket recv error. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
             TearDownClient(client);
+            return NULL;
         }
 
-        ParsePackage(client, recvBuffer, recvBytes);
+        if (!ParsePackage(client, recvBuffer, recvBytes))
+            return NULL;
     }
 
     TearDownClient(client);
+    return NULL;
+}
 
+void* TimestampLoop(void* params)
+{
+    (void)params;
+
+    syslog(LOG_INFO, "Timestamp thread created.");
+
+
+    while (!g_exitProgram)
+    {
+        sleep(10);
+
+        char timeBuffer[256];
+        time_t currentTime = time(NULL);
+        struct tm localTime;
+        localtime_r(&currentTime, &localTime);
+        strftime(timeBuffer, 256, "%a, %d %b %Y %T %z", &localTime);
+        
+        char lineBuffer[256];
+        int lineSize = snprintf(lineBuffer, 256, "timestramp:%s\n", timeBuffer);
+
+        syslog(LOG_INFO, "Writing timestamp %s.", timeBuffer);
+     
+        pthread_mutex_lock(&g_outputFileMutex);
+        if (RETRY_ON_INTERRUPT(write(g_outputFile, lineBuffer, lineSize)) == -1)
+        {
+            pthread_mutex_unlock(&g_outputFileMutex);
+
+            syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            g_exitProgram = true;
+            return NULL;
+        }     
+        pthread_mutex_unlock(&g_outputFileMutex);
+    }
+    
     return NULL;
 }
 
@@ -346,6 +400,12 @@ void ExecuteServer()
         TearDownServer(EXIT_FAILURE);
     }
 
+    if (pthread_create(&timestampThread, NULL, &TimestampLoop, NULL) != 0)
+    {
+        syslog(LOG_ERR, "Cannot create timestramp thread.");
+        TearDownServer(EXIT_FAILURE);
+    }
+
     while (!g_exitProgram)
     {
         struct sockaddr_in clientAddress;
@@ -375,8 +435,7 @@ void ExecuteServer()
         pthread_t newThread;
         if (pthread_create(&newThread, NULL, &ClientLoop, newClient) != 0)
         {
-
-            syslog(LOG_ERR, "Cannot create thread.");
+            syslog(LOG_ERR, "Cannot create client thread.");
             free(newClient);
             TearDownServer(EXIT_FAILURE);
         }
