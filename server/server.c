@@ -92,7 +92,7 @@ void TearDownClient(struct Client* client)
 
 void TearDownServer(int exitCode)
 {
-    syslog(LOG_INFO, "Terminating...");
+    syslog(LOG_INFO, "Terminating server...");
 
     g_exitProgram = true;
 
@@ -135,6 +135,8 @@ void TearDownServer(int exitCode)
 
     sigaction(SIGTERM, &g_oldSigtermHandler, NULL);
     sigaction(SIGTERM, &g_oldSigintHandler, NULL);
+
+    syslog(LOG_INFO, "Exiting process...");
 
     exit(exitCode);
 }
@@ -306,9 +308,14 @@ void* TimestampLoop(void* params)
     syslog(LOG_INFO, "Timestamp thread created.");
 
 
+    int remaining = 10;
     while (!g_exitProgram)
     {
-        sleep(10);
+        remaining = sleep(remaining);
+        if (remaining != 0)
+            continue;
+              
+        remaining = 10;
 
         char timeBuffer[256];
         time_t currentTime = time(NULL);
@@ -317,7 +324,7 @@ void* TimestampLoop(void* params)
         strftime(timeBuffer, 256, "%a, %d %b %Y %T %z", &localTime);
         
         char lineBuffer[256];
-        int lineSize = snprintf(lineBuffer, 256, "timestramp:%s\n", timeBuffer);
+        int lineSize = snprintf(lineBuffer, 256, "timestamp:%s\n", timeBuffer);
 
         syslog(LOG_INFO, "Writing timestamp %s.", timeBuffer);
      
@@ -402,7 +409,7 @@ void ExecuteServer()
 
     if (pthread_create(&timestampThread, NULL, &TimestampLoop, NULL) != 0)
     {
-        syslog(LOG_ERR, "Cannot create timestramp thread.");
+        syslog(LOG_ERR, "Cannot create timestamp thread.");
         TearDownServer(EXIT_FAILURE);
     }
 
