@@ -12,6 +12,8 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
+#define USE_AESD_CHAR_DEVICE 1
+
 #define RETRY_ON_INTERRUPT(expression)                  \
 ({                                                      \
     int RETRY_ON_INTERRUPT_result = 0;                  \
@@ -46,15 +48,18 @@ struct Client
 
 static bool g_exitProgram = false;
 static int g_serverSocket = -1;
-static int g_outputFile = -1;
-static pthread_t timestampThread;
 static struct Client* g_clientListHead;
 static pthread_mutex_t g_clientListMutex;
 static pthread_mutex_t g_outputFileMutex;
-static const char* g_outputFilePath = "/var/tmp/aesdsocketdata";
 static struct sigaction g_oldSigtermHandler;
 static struct sigaction g_oldSigintHandler;
 const size_t g_lineBufferStartSize = 64;
+
+#if USE_AESD_CHAR_DEVICE == 1
+    static const char* g_outputFilePath = "/dev/aesdchar";
+#else
+    static const char* g_outputFilePath = "/var/tmp/aesdsocketdata";
+#endif
 
 void TearDownClient(struct Client* client)
 {
@@ -96,8 +101,6 @@ void TearDownServer(int exitCode)
 
     g_exitProgram = true;
 
-    pthread_join(timestampThread, NULL);
-
     pthread_mutex_lock(&g_clientListMutex);
     struct Client* currentClient = g_clientListHead;
     while (currentClient != NULL)
@@ -114,13 +117,9 @@ void TearDownServer(int exitCode)
 
     g_clientListHead = NULL;
 
-    if (g_outputFile != -1)
-    {
-        close(g_outputFile);
-        g_outputFile = -1;
-    }
-
-    remove(g_outputFilePath);
+    #if USE_AESD_CHAR_DEVICE != 1
+        remove(g_outputFilePath);
+    #endif
 
     if (g_serverSocket != -1)
     {
@@ -145,7 +144,14 @@ bool ProcessPackage(struct Client* client)
 {
     pthread_mutex_lock(&g_outputFileMutex);
 
-    if (RETRY_ON_INTERRUPT(write(g_outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
+    int outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
+    if (outputFile == -1)
+    {
+        syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+        TearDownServer(EXIT_FAILURE);
+    }
+
+    if (RETRY_ON_INTERRUPT(write(outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
     {
         pthread_mutex_unlock(&g_outputFileMutex);
 
@@ -154,54 +160,36 @@ bool ProcessPackage(struct Client* client)
         return false;                  
     }
 
-    fsync(g_outputFile);
-    pthread_mutex_unlock(&g_outputFileMutex);
-
-    pthread_mutex_lock(&g_outputFileMutex);
-    off_t fileSize = lseek(g_outputFile, 0, SEEK_END);
-    if (fileSize == -1)
-    {
-        pthread_mutex_unlock(&g_outputFileMutex);
-        
-        syslog(LOG_ERR, "Cannot seek at the end of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownClient(client);
-        return false;
-    }
-    
-    if (lseek(g_outputFile, 0, SEEK_SET) == -1)
-    {
-        pthread_mutex_unlock(&g_outputFileMutex);
-
-        syslog(LOG_ERR, "Cannot seek at the start of file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownClient(client);
-        return false;
-    }
-    
-    while (fileSize > 0)
+    while (true)
     {
         char fileBuffer[512];
-        int readBytes = RETRY_ON_INTERRUPT(read(g_outputFile, fileBuffer, sizeof(fileBuffer)));
+        int readBytes = RETRY_ON_INTERRUPT(read(outputFile, fileBuffer, sizeof(fileBuffer)));
         if (readBytes == -1)
         {
+            close(outputFile);
             pthread_mutex_unlock(&g_outputFileMutex);
 
             syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
             TearDownClient(client);
             return false;
         }
+        else if (readBytes == 0)
+        {
+            break;
+        }
 
         int sendResult = RETRY_ON_INTERRUPT(send(client->socket, fileBuffer, readBytes, 0));
         if (sendResult == -1)
         {
+            close(outputFile);          
             pthread_mutex_unlock(&g_outputFileMutex);
 
             syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
             TearDownClient(client);
             return false;
         }
-
-        fileSize -= readBytes;
     }
+    close(outputFile);
     pthread_mutex_unlock(&g_outputFileMutex);
 
     client->lineBufferCursor = 0;
@@ -301,48 +289,6 @@ void* ClientLoop(void* argument)
     return NULL;
 }
 
-void* TimestampLoop(void* params)
-{
-    (void)params;
-
-    syslog(LOG_INFO, "Timestamp thread created.");
-
-
-    int remaining = 10;
-    while (!g_exitProgram)
-    {
-        remaining = sleep(remaining);
-        if (remaining != 0)
-            continue;
-              
-        remaining = 10;
-
-        char timeBuffer[256];
-        time_t currentTime = time(NULL);
-        struct tm localTime;
-        localtime_r(&currentTime, &localTime);
-        strftime(timeBuffer, 256, "%a, %d %b %Y %T %z", &localTime);
-        
-        char lineBuffer[256];
-        int lineSize = snprintf(lineBuffer, 256, "timestamp:%s\n", timeBuffer);
-
-        syslog(LOG_INFO, "Writing timestamp %s.", timeBuffer);
-     
-        pthread_mutex_lock(&g_outputFileMutex);
-        if (RETRY_ON_INTERRUPT(write(g_outputFile, lineBuffer, lineSize)) == -1)
-        {
-            pthread_mutex_unlock(&g_outputFileMutex);
-
-            syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-            g_exitProgram = true;
-            return NULL;
-        }     
-        pthread_mutex_unlock(&g_outputFileMutex);
-    }
-    
-    return NULL;
-}
-
 void SignalHandler()
 {
     g_exitProgram = true;
@@ -397,19 +343,6 @@ void ExecuteServer()
     if (listenResult == -1)
     {
         syslog(LOG_ERR, "Cannot listen socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
-        TearDownServer(EXIT_FAILURE);
-    }
-
-    g_outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
-    if (g_outputFile == -1)
-    {
-        syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownServer(EXIT_FAILURE);
-    }
-
-    if (pthread_create(&timestampThread, NULL, &TimestampLoop, NULL) != 0)
-    {
-        syslog(LOG_ERR, "Cannot create timestamp thread.");
         TearDownServer(EXIT_FAILURE);
     }
 

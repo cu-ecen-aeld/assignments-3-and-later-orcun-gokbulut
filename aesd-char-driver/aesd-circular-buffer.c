@@ -10,6 +10,7 @@
 
 #ifdef __KERNEL__
 #include <linux/string.h>
+#include <linux/slab.h>
 #else
 #include <string.h>
 #endif
@@ -40,7 +41,7 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
         if (characterOffset + entry->size > char_offset)
         {
             *entry_offset_byte_rtn = char_offset - characterOffset;
-            return entry;
+            return bufferOffset;
         }
 
         characterOffset += entry->size;
@@ -62,6 +63,12 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 */
 void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
 {
+
+    if (buffer->entry[buffer->in_offs].buffptr != NULL)
+    {
+        kfree(buffer->entry[buffer->in_offs].buffptr);
+        buffer->entry[buffer->in_offs].size = 0;
+    }
 
     buffer->entry[buffer->in_offs] = *add_entry;
 
