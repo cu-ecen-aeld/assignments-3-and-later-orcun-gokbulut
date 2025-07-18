@@ -17,54 +17,139 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
+#include <linux/mutex.h>
 #include "aesdchar.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
-MODULE_AUTHOR("Your Name Here"); /** TODO: fill in your name **/
+MODULE_AUTHOR("Yigit Orcun Gokbulut"); /** TODO: fill in your name **/
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
+struct aesd_file_handle
+{
+    char* lineBuffer;
+    size_t lineBufferSize;
+    struct mutex lineBufferMutex;
+};
+
+int aesd_open(struct inode *inode, struct file *filp);
+int aesd_release(struct inode *inode, struct file *filp);
+ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+int aesd_init_module(void);
+void aesd_cleanup_module(void);
+
 int aesd_open(struct inode *inode, struct file *filp)
 {
     PDEBUG("open");
-    /**
-     * TODO: handle open
-     */
+    
+    filp->private_data = kmalloc(sizeof(struct aesd_file_handle), GFP_KERNEL);
+    memset(filp->private_data, 0, sizeof(struct aesd_file_handle));
+
+    struct aesd_file_handle* handle = (struct aesd_file_handle*)filp->private_data;
+    mutex_init(&handle->lineBufferMutex);
+
     return 0;
 }
 
 int aesd_release(struct inode *inode, struct file *filp)
 {
     PDEBUG("release");
-    /**
-     * TODO: handle release
-     */
+
+    struct aesd_file_handle* handle = (struct aesd_file_handle*)filp->private_data;
+    if (handle->lineBuffer != NULL)
+    {
+        kfree(handle->lineBuffer);
+        handle->lineBuffer = NULL;
+        handle->lineBufferSize = 0;
+        kfree(handle);
+    }
+
     return 0;
 }
 
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
-                loff_t *f_pos)
+ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
     ssize_t retval = 0;
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle read
-     */
+    
+    if (down_read_interruptible(&aesd_device.sem) != 0)
+    {
+        return -EINTR;
+    }
+
+    size_t entry_offset;
+    struct aesd_buffer_entry* entry = aesd_circular_buffer_find_entry_offset_for_fpos(&aesd_device.buffer, *f_pos, &entry_offset);
+
+    if (entry == NULL)
+    {
+        up_read(&aesd_device.sem);
+        return 0;
+    }
+
+    if (entry_offset > entry->size - entry_offset)
+        retval = entry->size - entry_offset;
+     
+    copy_to_user(buf,  entry->buffptr + entry_offset, retval);
+
+    up_read(&aesd_device.sem);
+
     return retval;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
-                loff_t *f_pos)
+ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
     ssize_t retval = -ENOMEM;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle write
-     */
+
+    struct aesd_file_handle* handle = (struct aesd_file_handle*)filp->private_data;
+
+    mutex_lock(&handle->lineBufferMutex);
+    PDEBUG("Mutex acc");
+
+    if (handle->lineBuffer == NULL)
+    {
+        handle->lineBuffer = kmalloc(count, GFP_KERNEL);
+        handle->lineBufferSize = count;
+        copy_from_user(handle->lineBuffer, buf, count);
+    }
+
+    for (size_t i = handle->lineBufferSize - count; i < handle->lineBufferSize; i++)
+    {
+        PDEBUG("I: %zu, C: %c", i, handle->lineBuffer[i]);
+
+        if (handle->lineBuffer[i] != '\n')
+            continue;
+
+        down_write(&aesd_device.sem);
+        PDEBUG("down write");
+
+        struct aesd_buffer_entry entry;
+        entry.buffptr = kmalloc(i, GFP_KERNEL);
+        if (entry.buffptr == NULL)
+        {
+            up_read(&aesd_device.sem);
+            mutex_unlock(&handle->lineBufferMutex);
+            return -ENOMEM;
+        }
+
+        memcpy((char*)entry.buffptr, handle->lineBuffer, i);
+        aesd_circular_buffer_add_entry(&aesd_device.buffer, &entry);
+
+        up_write(&aesd_device.sem);
+        PDEBUG("up write");
+
+        memmove(handle->lineBuffer, handle->lineBuffer + i, handle->lineBufferSize - i);
+        i = 0;
+    }
+    mutex_unlock(&handle->lineBufferMutex);
+    PDEBUG("Mutex releasee");
+
     return retval;
 }
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
@@ -84,10 +169,9 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     if (err) {
         printk(KERN_ERR "Error %d adding aesd cdev", err);
     }
+      
     return err;
 }
-
-
 
 int aesd_init_module(void)
 {
@@ -101,10 +185,9 @@ int aesd_init_module(void)
         return result;
     }
     memset(&aesd_device,0,sizeof(struct aesd_dev));
-
-    /**
-     * TODO: initialize the AESD specific portion of the device
-     */
+    
+    aesd_circular_buffer_init(&aesd_device.buffer);
+    init_rwsem(&aesd_device.sem);
 
     result = aesd_setup_cdev(&aesd_device);
 

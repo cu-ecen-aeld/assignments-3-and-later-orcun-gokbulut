@@ -51,7 +51,7 @@ static pthread_t timestampThread;
 static struct Client* g_clientListHead;
 static pthread_mutex_t g_clientListMutex;
 static pthread_mutex_t g_outputFileMutex;
-static const char* g_outputFilePath = "/var/tmp/aesdsocketdata";
+static const char* g_outputFilePath = "/dev/aesdchar";
 static struct sigaction g_oldSigtermHandler;
 static struct sigaction g_oldSigintHandler;
 const size_t g_lineBufferStartSize = 64;
@@ -96,7 +96,7 @@ void TearDownServer(int exitCode)
 
     g_exitProgram = true;
 
-    pthread_join(timestampThread, NULL);
+    //pthread_join(timestampThread, NULL);
 
     pthread_mutex_lock(&g_clientListMutex);
     struct Client* currentClient = g_clientListHead;
@@ -120,7 +120,7 @@ void TearDownServer(int exitCode)
         g_outputFile = -1;
     }
 
-    remove(g_outputFilePath);
+    //remove(g_outputFilePath);
 
     if (g_serverSocket != -1)
     {
@@ -439,6 +439,7 @@ void ExecuteServer()
         newClient->socket = clientSocket;
         memcpy(&newClient->address, &clientAddress, sizeof(clientAddress));
 
+        /*
         pthread_t newThread;
         if (pthread_create(&newThread, NULL, &ClientLoop, newClient) != 0)
         {
@@ -446,6 +447,7 @@ void ExecuteServer()
             free(newClient);
             TearDownServer(EXIT_FAILURE);
         }
+        */
     }
 }
 
