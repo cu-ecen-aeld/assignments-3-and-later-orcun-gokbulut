@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/lib/modules/6.8.0-64-generic/build/include",
+                "/lib/modules/6.8.0-64-generic/build/arch/x86/include",
+                "/lib/modules/6.8.0-64-generic/build/arch/x86/include/generated"
+            ],
+            "defines": [
+                "KBUILD_MODNAME=\"aesdchar\"",
+                "__KERNEL__",
+                "__GNUC__",
+                "MODULE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}

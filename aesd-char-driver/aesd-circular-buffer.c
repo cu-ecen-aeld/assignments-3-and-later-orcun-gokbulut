@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #else
 #include <string.h>
+#include <malloc.h>
 #endif
 
 #include "aesd-circular-buffer.h"
@@ -41,7 +42,7 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
         if (characterOffset + entry->size > char_offset)
         {
             *entry_offset_byte_rtn = char_offset - characterOffset;
-            return bufferOffset;
+            return entry;
         }
 
         characterOffset += entry->size;
@@ -66,7 +67,11 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
 
     if (buffer->entry[buffer->in_offs].buffptr != NULL)
     {
-        kfree(buffer->entry[buffer->in_offs].buffptr);
+        #ifdef __KERNEL__
+            kfree(buffer->entry[buffer->in_offs].buffptr);
+        #else
+            free((void*)buffer->entry[buffer->in_offs].buffptr);
+        #endif
         buffer->entry[buffer->in_offs].size = 0;
     }
 

@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+        "fs.h": "c",
+        "ioctl.h": "c",
+        "pthread.h": "c",
+        "aesd_ioctl.h": "c",
+        "types.h": "c",
+        "stdint.h": "c",
+        "aesd-circular-buffer.h": "c",
+        "slab.h": "c",
+        "string.h": "c"
+    }
+}

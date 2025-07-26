@@ -8,9 +8,12 @@
 #include <fcntl.h>
 #include <syslog.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
+
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define USE_AESD_CHAR_DEVICE 1
 
@@ -50,6 +53,7 @@ static bool g_exitProgram = false;
 static int g_serverSocket = -1;
 static struct Client* g_clientListHead;
 static pthread_mutex_t g_clientListMutex;
+static int g_outputFile = -1;
 static pthread_mutex_t g_outputFileMutex;
 static struct sigaction g_oldSigtermHandler;
 static struct sigaction g_oldSigintHandler;
@@ -117,6 +121,12 @@ void TearDownServer(int exitCode)
 
     g_clientListHead = NULL;
 
+    if (g_outputFile != -1)
+    {
+        close(g_outputFile);
+        g_outputFile = -1;
+    }
+
     #if USE_AESD_CHAR_DEVICE != 1
         remove(g_outputFilePath);
     #endif
@@ -144,29 +154,57 @@ bool ProcessPackage(struct Client* client)
 {
     pthread_mutex_lock(&g_outputFileMutex);
 
-    int outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
-    if (outputFile == -1)
+    if (client->lineBufferCursor == 23 && memcmp(client->lineBuffer, "AESDCHAR_IOSEEKTO:", 19))
     {
-        syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownServer(EXIT_FAILURE);
-    }
+        struct aesd_seekto seek_to;
+        seek_to.write_cmd = client->lineBuffer[19] - '0';
+        seek_to.write_cmd_offset = client->lineBuffer[21] - '0';
+        if (ioctl(g_outputFile, AESDCHAR_IOCSEEKTO, &seek_to) != 0)
+        {
+            pthread_mutex_unlock(&g_outputFileMutex);
 
-    if (RETRY_ON_INTERRUPT(write(outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
+            syslog(LOG_ERR, "Cannot ioctl file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+            return false;               
+        }
+    }
+    else
     {
-        pthread_mutex_unlock(&g_outputFileMutex);
+        if (RETRY_ON_INTERRUPT(write(g_outputFile, client->lineBuffer, client->lineBufferCursor)) == -1)
+        {
+            pthread_mutex_unlock(&g_outputFileMutex);
 
-        syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
-        TearDownClient(client);
-        return false;                  
+            syslog(LOG_ERR, "Cannot write to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+            TearDownClient(client);
+            return false;                  
+        }
+
+        off_t position = lseek(g_outputFile, 0, SEEK_CUR);
+        if (position == -1)
+        {
+                pthread_mutex_unlock(&g_outputFileMutex);
+
+                syslog(LOG_ERR, "Cannot tell file offset. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+                TearDownClient(client);
+                return false;       
+        }
+
+        if (lseek(g_outputFile, 0, SEEK_SET) == -1)
+        {
+                pthread_mutex_unlock(&g_outputFileMutex);
+        
+                syslog(LOG_ERR, "Cannot seek to start of the file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+                TearDownClient(client);
+                return false;       
+        }
     }
-
+    
     while (true)
     {
         char fileBuffer[512];
-        int readBytes = RETRY_ON_INTERRUPT(read(outputFile, fileBuffer, sizeof(fileBuffer)));
+        int readBytes = RETRY_ON_INTERRUPT(read(g_outputFile, fileBuffer, sizeof(fileBuffer)));
         if (readBytes == -1)
         {
-            close(outputFile);
             pthread_mutex_unlock(&g_outputFileMutex);
 
             syslog(LOG_ERR, "Cannot read from file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
@@ -181,7 +219,6 @@ bool ProcessPackage(struct Client* client)
         int sendResult = RETRY_ON_INTERRUPT(send(client->socket, fileBuffer, readBytes, 0));
         if (sendResult == -1)
         {
-            close(outputFile);          
             pthread_mutex_unlock(&g_outputFileMutex);
 
             syslog(LOG_ERR, "Cannot send bytes to file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
@@ -189,7 +226,7 @@ bool ProcessPackage(struct Client* client)
             return false;
         }
     }
-    close(outputFile);
+
     pthread_mutex_unlock(&g_outputFileMutex);
 
     client->lineBufferCursor = 0;
@@ -360,6 +397,20 @@ void ExecuteServer()
             syslog(LOG_ERR, "Cannot accept socket. Error No: %d, Error Text: \"%s\".", errno, strerror(errno));
             TearDownServer(EXIT_FAILURE);
         }
+
+        pthread_mutex_lock(&g_outputFileMutex);
+        if (g_outputFile == -1)
+        {
+            g_outputFile = open(g_outputFilePath, O_RDWR | O_CREAT, 0666);
+            if (g_outputFile == -1)
+            {
+                pthread_mutex_unlock(&g_outputFileMutex);
+
+                syslog(LOG_ERR, "Cannot open file. File Path: \"%s\", Error No: %d, Error Text: \"%s\".", g_outputFilePath, errno, strerror(errno));
+                TearDownServer(EXIT_FAILURE);
+            }
+        }
+        pthread_mutex_unlock(&g_outputFileMutex);
 
         struct Client* newClient = (struct Client*)malloc(sizeof(struct Client));
         if (newClient == NULL)

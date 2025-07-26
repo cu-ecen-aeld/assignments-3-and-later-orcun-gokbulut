@@ -1,0 +1,53 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "shell",
+			"label": "Build Server",
+			"command": "/usr/bin/make",
+			"args": [],
+			"options": {
+				"cwd": "${workspaceFolder}/server"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "compiler: /usr/bin/gcc"
+		},
+		{
+			"type": "shell",
+			"label": "Clean Server",
+			"command": "/usr/bin/make",
+			"args": [ "clean" ],
+			"options": {
+				"cwd": "${workspaceFolder}/server"
+			},
+			"group": "build",
+		},
+		{
+			"type": "shell",
+			"label": "Build Module",
+			"command": "/usr/bin/make",
+			"args": [],
+			"options": {
+				"cwd": "${workspaceFolder}/aesd-char-driver"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "compiler: /usr/bin/gcc"
+		},
+		{
+			"type": "shell",
+			"label": "Clean Module",
+			"command": "/usr/bin/make",
+			"args": [ "clean" ],
+			"options": {
+				"cwd": "${workspaceFolder}/aesd-char-driver"
+			},
+			"group": "build",
+		}
+	]
+}
